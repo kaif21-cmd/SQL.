@@ -19,8 +19,12 @@ A topic-wise guide built from my practice session. Each section has the concept,
 13. [UNION and UNION ALL](#13-union-and-union-all)
 14. [Triggers](#14-triggers)
 15. [Stored Procedures](#15-stored-procedures)
-16. [Common Mistakes and Fixes](#16-common-mistakes-and-fixes)
-17. [Quick Reference Cheat Sheet](#17-quick-reference-cheat-sheet)
+16. [Cursors](#16-cursors)
+17. [Window Functions](#17-window-functions)
+18. [Date and String Functions](#18-date-and-string-functions)
+19. [Transactions](#19-transactions)
+20. [Common Mistakes and Fixes](#20-common-mistakes-and-fixes)
+21. [Quick Reference Cheat Sheet](#21-quick-reference-cheat-sheet)
 
 ---
 
@@ -584,6 +588,72 @@ UPDATE Employees SET salary = 65000 WHERE emp_id = 102;
 SELECT * FROM SalaryAudit;   -- shows old (40000) and new (65000) salary
 ```
 
+### More trigger examples
+
+#### BEFORE INSERT: validate data
+
+```sql
+DELIMITER //
+
+CREATE TRIGGER check_salary
+BEFORE INSERT ON Employees
+FOR EACH ROW
+BEGIN
+    IF NEW.salary < 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Salary cannot be negative';
+    END IF;
+END //
+
+DELIMITER ;
+
+INSERT INTO Employees (emp_id, emp_name, salary)
+VALUES (112, 'zara', -5000);   -- ERROR: Salary cannot be negative
+```
+
+- `BEFORE INSERT` runs before the row is saved, so it can reject bad data.
+- `SIGNAL SQLSTATE '45000'` raises a custom error and cancels the insert.
+
+#### AFTER INSERT: activity log
+
+```sql
+CREATE TABLE logss (
+    log_id      INT AUTO_INCREMENT PRIMARY KEY,
+    emp_id      INT,
+    action_name VARCHAR(30),
+    log_time    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+DELIMITER //
+
+CREATE TRIGGER after_employee_insert
+AFTER INSERT ON Employees
+FOR EACH ROW
+BEGIN
+    INSERT INTO logss (emp_id, action_name)
+    VALUES (NEW.emp_id, 'INSERT');
+END //
+
+DELIMITER ;
+
+INSERT INTO Employees (emp_id, emp_name, salary) VALUES (119, 'bdiya', 30000);
+SELECT * FROM logss;   -- one log row for the new employee
+```
+
+#### Managing triggers
+
+```sql
+SHOW TRIGGERS;                                   -- list triggers
+DROP TRIGGER IF EXISTS after_employee_insert;    -- remove one trigger
+
+-- Generate DROP statements for every trigger in the current database
+SELECT CONCAT('DROP TRIGGER IF EXISTS `', TRIGGER_NAME, '`;') AS drop_command
+FROM INFORMATION_SCHEMA.TRIGGERS
+WHERE TRIGGER_SCHEMA = DATABASE();
+```
+
+Two triggers with the same name cannot exist in one database, so drop the old one before re-creating it.
+
 ---
 
 ## 15. Stored Procedures
@@ -631,9 +701,230 @@ CALL CalculateBonus(103);
 - `DECLARE` creates a local variable.
 - `SELECT ... INTO` stores a query result into a variable.
 
+### Managing procedures
+
+```sql
+SHOW PROCEDURE STATUS WHERE Db = DATABASE();     -- list procedures
+DROP PROCEDURE IF EXISTS HighSalaryEmployees;    -- remove one procedure
+
+-- Generate DROP statements for every procedure in the current database
+SELECT CONCAT('DROP PROCEDURE IF EXISTS `', ROUTINE_NAME, '`;') AS drop_command
+FROM information_schema.ROUTINES
+WHERE ROUTINE_SCHEMA = DATABASE()
+  AND ROUTINE_TYPE = 'PROCEDURE';
+```
+
 ---
 
-## 16. Common Mistakes and Fixes
+## 16. Cursors
+
+A **cursor** lets a stored procedure read the rows of a query **one at a time**.
+
+Steps:
+
+1. `DECLARE` variables, then the cursor (`DECLARE c CURSOR FOR SELECT ...`).
+2. `DECLARE CONTINUE HANDLER FOR NOT FOUND` to set a flag when there are no more rows.
+3. `OPEN` the cursor.
+4. `FETCH` the next row `INTO` variables inside a `LOOP`, and `LEAVE` the loop when the flag is set.
+5. `CLOSE` the cursor.
+
+### Read rows one by one
+
+```sql
+DELIMITER //
+
+CREATE PROCEDURE HighSalaryEmployees()
+BEGIN
+    DECLARE v_name   VARCHAR(100);
+    DECLARE v_salary DECIMAL(10,2);
+    DECLARE finished INT DEFAULT 0;
+
+    DECLARE emp_cursor CURSOR FOR
+        SELECT emp_name, salary
+        FROM employees
+        WHERE salary > 40000;
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND
+        SET finished = 1;
+
+    OPEN emp_cursor;
+
+    read_loop: LOOP
+        FETCH emp_cursor INTO v_name, v_salary;
+
+        IF finished = 1 THEN
+            LEAVE read_loop;
+        END IF;
+
+        SELECT v_name AS Employee_Name, v_salary AS Salary;
+    END LOOP;
+
+    CLOSE emp_cursor;
+END //
+
+DELIMITER ;
+
+CALL HighSalaryEmployees();
+```
+
+### Update rows with a cursor
+
+```sql
+DELIMITER //
+
+CREATE PROCEDURE IncreaseSalary()
+BEGIN
+    DECLARE v_id INT;
+    DECLARE finished INT DEFAULT 0;
+
+    DECLARE emp_cursor CURSOR FOR SELECT emp_id FROM employees;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET finished = 1;
+
+    OPEN emp_cursor;
+
+    read_loop: LOOP
+        FETCH emp_cursor INTO v_id;
+
+        IF finished = 1 THEN
+            LEAVE read_loop;
+        END IF;
+
+        UPDATE employees SET salary = salary + 5000 WHERE emp_id = v_id;
+    END LOOP;
+
+    CLOSE emp_cursor;
+END //
+
+DELIMITER ;
+
+CALL IncreaseSalary();   -- every employee gets +5000
+```
+
+- Declaration order inside a procedure must be: **variables, then cursors, then handlers**.
+- A single `UPDATE employees SET salary = salary + 5000;` does the same job faster. Cursors work row by row, so use them only when each row needs separate processing.
+
+---
+
+## 17. Window Functions
+
+Window functions calculate a value for each row using a related set of rows **without collapsing the rows** (unlike `GROUP BY`). They use `OVER(...)`.
+
+```sql
+-- Unique sequential number, no ties
+SELECT emp_id, emp_name, dept_id, salary,
+       ROW_NUMBER() OVER (ORDER BY salary DESC) AS row_num
+FROM employees;
+
+-- Ties share a rank and the next rank is skipped (1, 2, 2, 4)
+SELECT emp_name, salary,
+       RANK() OVER (ORDER BY salary DESC) AS salary_rank
+FROM employees;
+
+-- Tie-breaker using a second ORDER BY column
+SELECT emp_name, salary,
+       ROW_NUMBER() OVER (ORDER BY salary DESC, emp_name ASC) AS employee_rank
+FROM employees;
+```
+
+| Function       | Behaviour when salaries are equal |
+|----------------|-----------------------------------|
+| `ROW_NUMBER()` | Always unique: 1, 2, 3, 4         |
+| `RANK()`       | Same rank for ties, then a gap: 1, 2, 2, 4 |
+| `DENSE_RANK()` | Same rank for ties, no gap: 1, 2, 2, 3 |
+
+`PARTITION BY` restarts the calculation for each group, for example `RANK() OVER (PARTITION BY dept_id ORDER BY salary DESC)` ranks employees inside each department.
+
+---
+
+## 18. Date and String Functions
+
+### Date functions
+
+```sql
+SELECT emp_id, emp_name, CURDATE() AS today FROM employees;
+
+SELECT YEAR(CURDATE())      AS current_year,
+       MONTH(CURDATE())     AS current_month,
+       DAY(CURRENT_DATE())  AS current_day;
+
+SELECT emp_name, DATE_FORMAT(CURDATE(), '%d-%m-%Y') AS formatted_date
+FROM employees;
+```
+
+| Format code | Meaning        |
+|-------------|----------------|
+| `%d`        | Day (01-31)    |
+| `%m`        | Month (01-12)  |
+| `%Y`        | 4-digit year   |
+
+`CURDATE()` returns only the date, while `NOW()` returns date and time.
+
+### String functions
+
+```sql
+SELECT emp_name,
+       UPPER(emp_name) AS upper_name,
+       LOWER(emp_name) AS lower_case
+FROM employees;
+
+SELECT emp_name, LENGTH(emp_name) AS name_length FROM employees;
+
+SELECT emp_id, CONCAT(emp_name, '-Department', dept_id) AS employee_details
+FROM employees;
+
+SELECT emp_name, SUBSTRING(emp_name, 1, 3) AS first_three_letters FROM employees;
+
+SELECT emp_name, REPLACE(emp_name, 'a', '@') AS modified_name FROM employees;
+```
+
+| Function                  | Purpose                                        |
+|---------------------------|------------------------------------------------|
+| `UPPER` / `LOWER`         | Change case                                    |
+| `LENGTH`                  | Number of characters (bytes)                   |
+| `CONCAT`                  | Join strings together                          |
+| `SUBSTRING(s, start, len)`| Extract part of a string (start counts from 1) |
+| `REPLACE(s, old, new)`    | Replace text                                   |
+
+---
+
+## 19. Transactions
+
+A **transaction** groups statements so they succeed or fail as one unit. Example: a transfer where one account is debited and another credited. Both must happen, or neither.
+
+| Command             | Purpose                                      |
+|---------------------|----------------------------------------------|
+| `START TRANSACTION` | Begin a transaction                          |
+| `COMMIT`            | Save all changes permanently                 |
+| `ROLLBACK`          | Undo all changes since `START TRANSACTION`   |
+
+### Transfer with COMMIT
+
+```sql
+START TRANSACTION;
+
+UPDATE employees SET salary = salary - 1000 WHERE emp_id = 101;
+UPDATE employees SET salary = salary + 1000 WHERE emp_id = 102;
+
+COMMIT;   -- both changes are saved
+```
+
+### Undo with ROLLBACK
+
+```sql
+START TRANSACTION;
+
+UPDATE employees SET salary = salary - 1000 WHERE emp_id = 101;
+
+ROLLBACK;   -- the update is cancelled, data is unchanged
+```
+
+- **ACID**: Atomicity (all or nothing), Consistency (valid state), Isolation (transactions do not interfere), Durability (committed data is permanent).
+- Transactions need a transactional engine such as InnoDB.
+- DDL commands (`CREATE`, `ALTER`, `DROP`) cause an automatic commit and cannot be rolled back.
+
+---
+
+## 20. Common Mistakes and Fixes
 
 | Issue in the notes | Why it is a problem | Fix |
 |---|---|---|
@@ -647,10 +938,17 @@ CALL CalculateBonus(103);
 | `CALL GetEmployeeById(105)` with no `;` | Statement may not execute or can merge with the next one | Always end with `;` |
 | Creating `employees` again after `DROP TABLE` | Works, but it's a new table with a different structure | Make sure to recreate it intentionally |
 | `UPDATE` without `WHERE` | Changes **every** row | Always filter, and test with `SELECT` first |
+| `INSERT INTO Employees (emp_id, name, salary)` | The column is called `emp_name`, not `name` | Use the real column name |
+| Trigger inserts into `Employee_Log` but the table is `Employee_LogS` | Table name mismatch | Use the exact table name |
+| `CALL ShowEmployees();` when the procedure is `ShowEmployeess` | Procedure name mismatch | Check with `SHOW PROCEDURE STATUS` |
+| Creating trigger `check_salary` twice | Trigger already exists | `DROP TRIGGER IF EXISTS` first, or rename it |
+| Inserting `emp_id` 110 twice | Duplicate `PRIMARY KEY` | Use a unique id |
+| `ROLLBACK;` followed by plain text on the same line | Extra text is a syntax error | Put notes after `--` or on a separate line |
+| Declaring the handler before the cursor | Wrong declaration order | Variables, then cursors, then handlers |
 
 ---
 
-## 17. Quick Reference Cheat Sheet
+## 21. Quick Reference Cheat Sheet
 
 ```sql
 -- Query structure
@@ -677,7 +975,12 @@ LIMIT    n OFFSET m;
 | Add / remove column        | `ALTER TABLE t ADD / DROP COLUMN c`           |
 | Auto log changes           | `CREATE TRIGGER ... AFTER UPDATE ...`         |
 | Reusable logic             | `CREATE PROCEDURE ... CALL ...`               |
+| Row-by-row processing      | `DECLARE c CURSOR FOR ...; OPEN; FETCH; CLOSE` |
+| Rank rows                  | `RANK() OVER (ORDER BY col DESC)`             |
+| Today's date               | `CURDATE()`                                   |
+| Join / change text         | `CONCAT(a, b)`, `REPLACE(s, 'x', 'y')`        |
+| Undo changes               | `START TRANSACTION; ...; ROLLBACK;`           |
 
 ---
 
-*Notes compiled from hands-on MySQL practice: DDL, DML, filtering, aggregation, joins, constraints, triggers and stored procedures.*
+*Notes compiled from hands-on MySQL practice: DDL, DML, filtering, aggregation, joins, constraints, triggers, stored procedures, cursors, window functions, date and string functions, and transactions.*
